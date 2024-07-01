@@ -21,182 +21,163 @@
 // THE SOFTWARE.
 
 #include <algorithm>
-#include <iostream>
-#include <iomanip>
-#include <sstream>
-#include <fstream>
-#include <string>
-
 #include <cstdlib>
-#include <cassert>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
 
-enum return_values {
-	kReturnBadArguments = 1,
-	kReturnCanNotOpen,
-	kReturnPrematureEndSQL,
-	kReturnCanNotOpenForWrite,
-	kReturnCanNotWrite,
-	kReturnMaxByteSizeExceeded,
-	kReturnUnknownReason,
+namespace fs = std::filesystem;
+
+enum class ReturnValues {
+  Success = 0,
+  BadArguments,
+  CanNotOpen,
+  PrematureEndSQL,
+  CanNotOpenForWrite,
+  CanNotWrite,
+  MaxByteSizeExceeded,
+  UnknownReason
 };
 
-bool isNewLine(char c) {
-	return (c == '\n' || c == '\r');
+bool isNewLine(char c) { return (c == '\n' || c == '\r'); }
+
+void outputStatistics(size_t currentBytes, size_t maxBytes,
+                      const std::string &prefix, const std::string &suffix = "",
+                      size_t barWidth = 37) {
+  std::cout << '\n' << std::setw(4) << std::right << prefix << '[';
+
+  float ratio = static_cast<float>(currentBytes) / maxBytes;
+  size_t maxBar = static_cast<size_t>(ratio * barWidth);
+
+  std::cout << std::string(maxBar, '=') << std::string(barWidth - maxBar, ' ')
+            << ']' << suffix;
+  std::cout.flush();
 }
 
-void outputStatistics(
-	size_t const& currentBytes,
-	size_t const& maxBytes,
-	std::string const& prefix,
-	std::string const& suffix = "",
-	size_t const barWidth = 37
-) {
-	std::cout << '\n';
-	std::cout << std::setw(4) << std::right << prefix << '[';
+std::string createOutputFilename(const fs::path &inputPath, size_t partCount) {
+  std::string stem = inputPath.stem().string();
+  std::string extension = inputPath.extension().string();
 
-	float const ratio = currentBytes/(float)maxBytes;
-	size_t const maxBar = ratio * barWidth;
+  std::ostringstream partStream;
+  partStream << std::setw(5) << std::setfill('0') << partCount;
 
-	for (size_t currentBar = 0; currentBar < maxBar; ++currentBar) {
-		std::cout << '=';
-	}
-
-	for (size_t currentEmpty = maxBar; currentEmpty < barWidth; ++currentEmpty) {
-		std::cout << ' ';
-	}
-
-	std::cout << ']' << suffix;
-	std::cout.flush();
+  return stem + "-" + partStream.str() + extension;
 }
 
-int main(int argc, char * const argv[]) {
-	size_t maxByteSize;
-	std::string inputFilePath;
-	size_t outputBarWidth = 60;
-	std::ifstream sqlFile;
+ReturnValues processFile(const fs::path &inputPath, size_t maxByteSize,
+                         size_t outputBarWidth) {
+  std::ifstream sqlFile(inputPath, std::ios::binary);
+  if (!sqlFile) {
+    std::cerr << "Can't open file (" << inputPath << ") for reading\n";
+    return ReturnValues::CanNotOpen;
+  }
 
-	if (argc < 3) {
-		std::cout << "Oops! Usage: " << argv[0] << " <input file> <maximum output file size in bytes> [output bar width]\n";
-		return kReturnBadArguments;
-	} else {
-		inputFilePath = argv[1];
-		maxByteSize = atol(argv[2]);
+  std::cout << "Good to go! Will split (" << inputPath
+            << ") to separate files with a maximum size of " << maxByteSize
+            << " bytes" << std::endl;
 
-		if (argc >= 4) {
-			outputBarWidth = atoi(argv[3]);
-		}
-	}
+  std::string lastReadStatement;
+  for (size_t partCount = 0;; ++partCount) {
+    std::string outputFilename = createOutputFilename(inputPath, partCount);
+    std::ofstream currentOutputFile(outputFilename, std::ios::binary);
 
-	sqlFile.open(inputFilePath.c_str(), std::ifstream::binary);
+    if (!currentOutputFile) {
+      std::cerr << "Fatal: Failed to open (" << outputFilename
+                << ") for writing" << std::endl;
+      return ReturnValues::CanNotOpenForWrite;
+    }
 
-	if (!sqlFile) {
-		std::cerr << "Can't open file (" << inputFilePath << ") for reading\n";
-		return kReturnCanNotOpen;
-	}
+    std::cout << "Will write part [" << partCount << "] to " << outputFilename
+              << std::endl;
 
-	std::string inputFileName(inputFilePath, inputFilePath.find_last_of('/') + 1);
-	std::cout << "Good to go! Will split (" << inputFilePath << " to separate files with a maximum size of " << maxByteSize << " bytes" << std::endl;
+    std::string blockOfStatements = lastReadStatement;
+    lastReadStatement.clear();
 
-	for (;;) {
-		static size_t partCount = 0;
-		std::stringstream partStream;
-		partStream << std::setw(5) << std::setfill('0') << partCount;
-		std::string outputFilename(partStream.str() + "-" + inputFileName);
+    while (sqlFile) {
+      std::string singleStatement;
+      bool insideQuotes = false;
+      bool isEscaped = false;
 
-		std::ofstream currentOutputFile(outputFilename.c_str(), std::ofstream::binary);
+      for (char current; sqlFile.get(current);) {
+        if (isEscaped) {
+          isEscaped = false;
+        } else if (current == '\\') {
+          isEscaped = true;
+        } else if (current == '\'') {
+          insideQuotes = !insideQuotes;
+        } else if (current == ';' && !insideQuotes) {
+          singleStatement += current;
+          break;
+        }
+        singleStatement += current;
 
-		if (!currentOutputFile) {
-			std::cerr << "Fatal: Failed to open (" << outputFilename << ") for writing" << std::endl;
-			return kReturnCanNotOpenForWrite;
-		} else {
-			std::cout << "Will write part [" << partCount << "] to " << outputFilename << std::endl;
-		}
+        if (singleStatement.length() > 1ULL * 1024 * 1024 * 1024) {
+          std::cerr << std::endl
+                    << "Too long statement - probably an internal bug"
+                    << std::endl;
+          return ReturnValues::MaxByteSizeExceeded;
+        }
+      }
 
-		static std::string lastReadStatement;
-		std::string blockOfStatements(lastReadStatement);
+      std::string linePreview = singleStatement.substr(0, 40);
+      linePreview.erase(
+          std::remove_if(linePreview.begin(), linePreview.end(), isNewLine),
+          linePreview.end());
 
-		while(sqlFile) {
-			// Fetch new statement, the first unescaped ';', that's not between '\''
-			std::string singleStatement;
+      outputStatistics(blockOfStatements.length(), maxByteSize,
+                       std::to_string(partCount) + " ",
+                       " " + linePreview + "...", outputBarWidth);
 
-			{
-				char current = 0;
-				bool endFound = false;
-				bool insideQuotes = false;
-				bool isEscaped = false;
+      if (singleStatement.length() > maxByteSize) {
+        std::cerr << std::endl
+                  << "Fatal: Smallest statement is bigger ("
+                  << singleStatement.length() << ") than given bytesize ("
+                  << maxByteSize << ")" << std::endl;
+        return ReturnValues::MaxByteSizeExceeded;
+      }
 
-				do {
-					sqlFile.get(current);
+      if (blockOfStatements.length() + singleStatement.length() > maxByteSize) {
+        lastReadStatement = singleStatement;
+        break;
+      }
 
-					if (!sqlFile) {
-						break;
-					}
+      blockOfStatements += singleStatement;
+    }
 
-					if (isEscaped) {
-						isEscaped = false;
-					} else if (current == '\\') {
-						isEscaped = true;
-					} else if (current == '\'') {
-						insideQuotes = !insideQuotes;
-					} else if (current == ';' && !insideQuotes) {
-						endFound = true;
-					}
+    outputStatistics(blockOfStatements.length(), maxByteSize,
+                     std::to_string(partCount), " Writing to file\n",
+                     outputBarWidth);
+    currentOutputFile << blockOfStatements;
 
-					singleStatement += current;
+    if (!currentOutputFile) {
+      std::cerr << "Fatal: Failed to write to output file, aborting\n";
+      return ReturnValues::CanNotWrite;
+    }
 
-					if (singleStatement.length() > 1L * 1024L * 1024L * 1024L) {
-						currentOutputFile.write(blockOfStatements.c_str(), blockOfStatements.length());
+    if (!sqlFile) {
+      break; // We're done!
+    }
+  }
 
-						std::string debugFilename("debug-" + inputFileName);
-						std::ofstream statementDebugFile(debugFilename.c_str(), std::ofstream::binary);
-						statementDebugFile.write(singleStatement.c_str(), singleStatement.length());
+  return ReturnValues::Success;
+}
 
-						std::cerr << std::endl << "Too long statement - probably an internal bug" << std::endl;
-						return kReturnMaxByteSizeExceeded;
-					}
-				} while (!endFound);
+int main(int argc, char *const argv[]) {
+  if (argc < 3) {
+    std::cout << "Usage: " << argv[0]
+              << " <input file> <maximum output file size in bytes> [output "
+                 "bar width]\n";
+    return static_cast<int>(ReturnValues::BadArguments);
+  }
 
-				std::string linePreview = singleStatement.substr(0, 40);
-				std::string::iterator newEnd = std::remove_if(linePreview.begin(), linePreview.end(), isNewLine);
-				linePreview.resize(std::distance(linePreview.begin(), newEnd));
+  fs::path inputFilePath = argv[1];
+  size_t maxByteSize = std::stoull(argv[2]);
+  size_t outputBarWidth = (argc >= 4) ? std::stoul(argv[3]) : 60;
 
-				outputStatistics(blockOfStatements.length(), maxByteSize, partStream.str() + " ", " " + linePreview + "...", outputBarWidth);
-			}
-
-			if (singleStatement.length() > maxByteSize) {
-				currentOutputFile.write(blockOfStatements.c_str(), blockOfStatements.length());
-
-				std::string debugFilename("debug-" + inputFileName);
-				std::ofstream statementDebugFile(debugFilename.c_str(), std::ofstream::binary);
-				statementDebugFile.write(singleStatement.c_str(), singleStatement.length());
-
-				std::cerr << std::endl << "Fatal: Smallest statement is bigger (" << singleStatement.length() << ") than given bytesize (" << maxByteSize << ")" << std::endl;
-				return kReturnMaxByteSizeExceeded;
-			}
-
-			if ((singleStatement.length() + blockOfStatements.length()) > maxByteSize) {
-				lastReadStatement = singleStatement;
-				break;
-			} else {
-				blockOfStatements += singleStatement;
-			}
-		}
-
-		outputStatistics(blockOfStatements.length(), maxByteSize, partStream.str(), " Writing to file\n", outputBarWidth);
-		currentOutputFile.write(blockOfStatements.c_str(), blockOfStatements.length());
-
-		if (!currentOutputFile) {
-			std::cerr << "Fatal: Failed to write to output file, aborting\n";
-			return kReturnCanNotWrite;
-		}
-
-		if (!sqlFile) {
-			// We're done!
-			break;
-		}
-
-		++partCount;
-	}
-
-	return 0;
+  return static_cast<int>(
+      processFile(inputFilePath, maxByteSize, outputBarWidth));
 }
